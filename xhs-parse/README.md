@@ -32,6 +32,38 @@ npx wrangler deploy
 
 打开部署后的地址即可使用内置网页：粘贴分享文案 → 解析 → 预览图片、在线播放视频、复制或代理下载地址。
 
+## ⚠️ 部署到 Cloudflare 后被风控（重要）
+
+**症状**：本地解析正常，部署到 Workers 后报 `未在输入中找到小红书作品链接`，步骤里能看到：
+
+```
+解析短链接：https://xhslink.cn/o/xxxxxxxx
+短链接跳转至：https://www.xiaohongshu.com/website-login/captcha?redirectPath=…&verifyUuid=…&verifyType=217
+```
+
+**原因**：不是代码 bug，而是**出口 IP 的信誉差异**。Cloudflare Worker 从 Cloudflare 自己的数据中心 IP 段出网，
+小红书对这类 IP 的风控比家用宽带严格得多，于是把短链跳转答成了「安全验证」页。你本地是住宅 IP，所以不触发。
+
+**已经做的两件事**：
+
+1. **自动还原真实链接。** 验证页虽然拦了跳转，但真实作品链接就放在 `redirectPath` 参数里。现在会把它解出来
+   直接请求作品页，**不再依赖短链那一跳成功**——所以你这次的输入很可能直接就通了。
+2. **说清楚失败原因。** 如果作品页也被拦，不再报含糊的「未找到链接」，而是返回 `risk_control`，并在页面步骤里
+   给出验证页地址。
+
+**如果仍然失败**：给 Worker 加 Cookie，这是最有效的办法：
+
+- 网页 UI 底部有「可选：小红书网页版 Cookie」输入框，**填一次就保存在浏览器 localStorage 里，刷新或重开页面都自动带上**
+  （折叠标题下会显示「已保存在本机浏览器（N 字符）」，旁边可「清除本机保存」）；同页还会记住「图片格式」和「视频偏好」的选择；
+- 或用参数：`GET /api/parse?url=…&cookie=<urlencoded>` / `POST {"url":"…","cookie":"…"}`；
+- Cookie 获取：浏览器打开 `https://www.xiaohongshu.com/explore` → F12 → 网络 → 任意请求 → 复制 `Cookie` 整行。
+
+> 实现细节：输入时逐字保存，并在点击「解析」「取一条最新示例」前再存一次。只监听 `change` 是不够的——
+> 它要等到失焦才触发，粘贴后直接刷新会丢。
+
+其他缓解手段（按有效性排序）：换成带住宅出口的服务端（VPS + 代理）、降低请求频率、使用自建域名的 Worker
+（共享 IP 段被刷得越狠越容易被拦）。
+
 ## 接口
 
 | 接口 | 说明 |
@@ -115,6 +147,8 @@ npx wrangler deploy
    参数保留只是为了兼容原项目 API 的调用方。
 6. **新增安全边界。** `/dl`、`/api/probe`、`/api/thumb` 只允许小红书媒体域名（`xhscdn.com`、`xiaohongshu.com`、
    `rednote.com`），并拒绝私网/回环地址，避免这个 Worker 被当成 SSRF 跳板。
+7. **新增风控兜底。** 短链跳转被答成 `website-login/captcha` 时，从 `redirectPath` 还原真实作品链接；
+   仍被拦截时返回 `risk_control` 错误码而不是含糊的「未找到链接」。详见上文风控章节。
 
 ## 测试结果
 
@@ -134,6 +168,8 @@ npx wrangler deploy
 | `/dl` 代理与 302 | ✅ 浏览器 Accept 走代理返回 `video/mp4`；脚本 Accept 返回 302 |
 | 域名白名单 / SSRF | ✅ 外域与 `127.0.0.1` 均被 400 拒绝 |
 | xhslink 短链 | ✅ 重定向跟随与最终 URL 提取已实测；无效短码会给出 `no_xhs_link` 与完整步骤 |
+| 风控跳转还原 | ✅ 用真实的 `website-login/captcha?redirectPath=…` URL 做单测，能还原出作品链接与作品 ID；被拦时返回 `risk_control` |
+| Cookie 本地持久化 | ✅ 打桩模拟「填 Cookie → 刷新页面」：input 自动回填、折叠块自动展开、解析请求确实带上完整 Cookie；清除后刷新为空 |
 | 内置 UI 脚本 | ✅ 语法检查通过；用 DOM 打桩跑通 `render()`（视频/图文/图集）与 `post()` 正常、报错、断网三条路径 |
 
 测试过程中修掉的两个真实缺陷：`/api/thumb` 会把视频当图片并以 `image/mp4` 返回；内置 UI 脚本少一个右括号
@@ -143,6 +179,8 @@ npx wrangler deploy
 
 - **链接会过期。** 作品链接携带日期信息，`xsec_token` 失效后必须重新获取；解析失败时会返回
   `no_note_data` 并附完整 `steps`。
+- **数据中心 IP 风控。** 部署在 Cloudflare 上比本地更容易被要求安全验证（返回 `risk_control`）；
+  填写 Cookie 可大幅提高成功率。详见上文风控章节。
 - **未配置 Cookie 时视频可能只有较低画质**，与大分辨率流相关的行为由平台决定。
 - **平台风控。** 请求频率过高可能触发验证页，此时返回 `no_initial_state`；本移植版内置了重试与请求头，
   但没有原项目的随机延时（`sleep_time`），因为 Worker 请求有 CPU/时长预算。

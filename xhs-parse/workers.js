@@ -792,6 +792,86 @@ class ParseError extends Error {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Risk control (风控)
+//
+// xiaohongshu answers datacenter IPs — Cloudflare Worker egress included — with a
+// verification hop instead of the note page. The good news: the short-link
+// redirect still carries the real target inside `redirectPath`, so the note URL
+// can be recovered from it. When the platform keeps demanding verification, a
+// specific `risk_control` error is returned instead of a confusing "no link".
+// ---------------------------------------------------------------------------
+
+const RISK_CONTROL_PATTERNS = [
+  '/website-login/captcha',
+  '/website-login',
+  'verifyuuid=',
+  'verifytype=',
+];
+
+const RISK_CONTROL_HINT =
+  '请求被小红书风控拦截（要求安全验证）。Cloudflare Worker 的出口是数据中心 IP，比家用宽带更容易被拦截。' +
+  '请在下方 Cookie 输入框粘贴小红书网页版 Cookie 后重试，或改用带 Cookie 的服务端环境请求。';
+
+function isRiskControlUrl(raw) {
+  const value = String(raw || '').toLowerCase();
+  if (!value) return false;
+  return RISK_CONTROL_PATTERNS.some((pattern) => value.includes(pattern));
+}
+
+function looksLikeRiskControlHtml(html) {
+  const value = String(html || '');
+  if (!value) return false;
+  return value.includes('/website-login/captcha') ||
+    value.includes('verifyUuid') ||
+    value.includes('请完成安全验证');
+}
+
+/** The note-URL regexes, applied to one candidate string. */
+function matchNoteUrl(candidate) {
+  const value = String(candidate || '');
+  if (!value) return null;
+  return RE_SHARE_XHS.exec(value) || RE_SHARE_RN.exec(value) ||
+    RE_LINK_XHS.exec(value) || RE_LINK_RN.exec(value) ||
+    RE_USER_XHS.exec(value) || RE_USER_RN.exec(value) ||
+    null;
+}
+
+/** Pull the real note URL out of a `website-login/captcha?redirectPath=…` hop. */
+function recoverNoteUrlFromRedirect(raw) {
+  let parsed;
+  try {
+    parsed = new URL(String(raw));
+  } catch (_) {
+    return '';
+  }
+  for (const key of ['redirectPath', 'redirect_url', 'redirectUrl', 'redirect', 'url']) {
+    let value = parsed.searchParams.get(key);
+    if (!value) continue;
+    // The target is sometimes double-encoded (`%253D` for `%3D`).
+    for (let round = 0; round < 3; round++) {
+      const match = matchNoteUrl(value);
+      if (match) return match[0];
+      let decoded = value;
+      try {
+        decoded = decodeURIComponent(value);
+      } catch (_) {
+        break;
+      }
+      if (decoded === value) break;
+      value = decoded;
+    }
+  }
+  return '';
+}
+
+/** Note pages are served over https; skip the extra http -> https hop. */
+function preferHttpsForSite(rawUrl) {
+  const value = String(rawUrl || '');
+  if (!/^http:\/\/(www\.)?(xiaohongshu|rednote)\.com\//i.test(value)) return value;
+  return value.replace(/^http:\/\//i, 'https://');
+}
+
 function extractLinkId(rawUrl) {
   try {
     const parsed = new URL(normalizeUrl(rawUrl));
@@ -885,13 +965,20 @@ async function extractXhsLinks(input, steps, options = {}) {
       current = resolved.url || '';
       steps.push('短链接跳转至：' + current);
     }
-    const match =
-      RE_SHARE_XHS.exec(current) ||
-      RE_SHARE_RN.exec(current) ||
-      RE_LINK_XHS.exec(current) ||
-      RE_LINK_RN.exec(current) ||
-      RE_USER_XHS.exec(current) ||
-      RE_USER_RN.exec(current);
+    let match = matchNoteUrl(current);
+    if (!match && isRiskControlUrl(current)) {
+      // A verification hop: the real target rides along inside `redirectPath`.
+      const recovered = recoverNoteUrlFromRedirect(current);
+      if (recovered) {
+        steps.push('跳转被风控拦截（要求安全验证），已从 redirectPath 还原作品链接：' + recovered);
+        current = recovered;
+        match = matchNoteUrl(current);
+      } else {
+        steps.push('跳转被风控拦截（要求安全验证），redirectPath 中未找到作品链接');
+      }
+    }
+    // Also covers a pasted verification URL that wraps the note link.
+    if (!match) match = matchNoteUrl(recoverNoteUrlFromRedirect(token));
     if (match) urls.push(match[0]);
   }
   return urls;
@@ -1033,20 +1120,29 @@ async function runParse(input, options = {}) {
 
   const links = await extractXhsLinks(text, steps, { cookie });
   if (!links.length) {
-    throw new ParseError('no_xhs_link', '未在输入中找到小红书作品链接', { steps });
+    const blocked = steps.some((step) => step.includes('风控'));
+    throw new ParseError(
+      blocked ? 'risk_control' : 'no_xhs_link',
+      blocked ? RISK_CONTROL_HINT : '未在输入中找到小红书作品链接',
+      { steps },
+    );
   }
-  const target = normalizeUrl(links[0]);
+  const target = preferHttpsForSite(normalizeUrl(links[0]));
   const noteId = extractLinkId(target);
   steps.push('作品链接：' + target);
   steps.push('作品 ID：' + noteId);
 
   const page = await requestUrl(target, { cookie });
   steps.push('页面大小：' + page.text.length + ' 字符');
+  if (isRiskControlUrl(page.url) || looksLikeRiskControlHtml(page.text)) {
+    steps.push('作品页返回安全验证页：' + page.url);
+    throw new ParseError('risk_control', RISK_CONTROL_HINT, { steps });
+  }
   const state = parseInitialState(page.text);
   if (!state) {
     throw new ParseError(
       'no_initial_state',
-      '页面中未找到 window.__INITIAL_STATE__（可能被风控拦截）',
+      '页面中未找到 window.__INITIAL_STATE__（可能被风控拦截或页面结构已变化）',
       { steps },
     );
   }
@@ -1150,11 +1246,15 @@ async function runParse(input, options = {}) {
 // A fresh sample link, so the UI's "example" button never goes stale
 // ---------------------------------------------------------------------------
 
-async function fetchSampleLink() {
+async function fetchSampleLink(cookie) {
   const steps = [];
-  const page = await requestUrl(XHS_ORIGIN + '/explore', {});
+  const page = await requestUrl(XHS_ORIGIN + '/explore', { cookie });
+  if (isRiskControlUrl(page.url) || looksLikeRiskControlHtml(page.text)) {
+    steps.push('首页返回安全验证页：' + page.url);
+    throw new ParseError('risk_control', RISK_CONTROL_HINT, { steps });
+  }
   const state = parseInitialState(page.text);
-  if (!state) throw new ParseError('no_initial_state', '未能在首页找到 __INITIAL_STATE__');
+  if (!state) throw new ParseError('no_initial_state', '未能在首页找到 __INITIAL_STATE__', { steps });
   let found = null;
   const walk = (node, depth) => {
     if (found || depth > 12 || node === null || typeof node !== 'object') return;
@@ -1202,6 +1302,13 @@ button:disabled{opacity:.5;cursor:wait}
 button.sm{padding:3px 10px;font-size:12px;border-radius:6px}
 select{background:#10131a;color:var(--tx);border:1px solid var(--line);border-radius:8px;
 padding:8px 10px;font:inherit}
+details.cook{margin-top:10px;border:1px solid var(--line);border-radius:10px;
+padding:8px 12px;background:#131721}
+details.cook summary{cursor:pointer;color:var(--dim);font-size:13px}
+.cookrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:6px}
+#cookie{width:100%;margin-top:8px;background:#10131a;color:var(--tx);border:1px solid var(--line);
+border-radius:8px;padding:8px 10px;font-family:var(--mono);font-size:12px}
+#cookie:focus{outline:none;border-color:var(--acc)}
 label.opt{color:var(--dim);font-size:13px;display:inline-flex;gap:6px;align-items:center}
 a{color:var(--acc);text-decoration:none}.btn{display:inline-block;padding:3px 10px;
 border-radius:6px;background:#252b38;font-size:12px;color:var(--tx)}
@@ -1268,6 +1375,16 @@ footer{margin-top:30px;color:#66707f;font-size:12px;line-height:1.8}
 </select></label>
 <span id="status"></span>
 </div>
+<details class="cook" id="cookbox">
+<summary>可选：小红书网页版 Cookie（部署在 Cloudflare 上被风控要求安全验证时填写）</summary>
+<input id="cookie" type="text" autocomplete="off" spellcheck="false"
+placeholder="web_session=…; a1=…; webId=…（F12 → 网络 → 任意请求 → 复制 Cookie）">
+<div class="cookrow">
+<span class="muted" id="cookstate">未填写</span>
+<button type="button" class="sm" id="cookclear">清除本机保存</button>
+</div>
+<p class="muted">Cookie 保存在你浏览器的 localStorage，<b>刷新或重开页面都会自动带上</b>；解析时随请求发给本 Worker，不会被记录或转发到别处。</p>
+</details>
 <div id="result"></div>
 <div id="error" class="card err" style="display:none"></div>
 <div id="lb" class="lb" onclick="lbClose()" role="dialog" aria-label="图片放大预览">
@@ -1284,8 +1401,32 @@ footer{margin-top:30px;color:#66707f;font-size:12px;line-height:1.8}
 <script>
 var inEl=document.getElementById("in"),runEl=document.getElementById("run"),
 fmtEl=document.getElementById("fmt"),prefEl=document.getElementById("pref"),
+cookieEl=document.getElementById("cookie"),cookBoxEl=document.getElementById("cookbox"),
+cookStateEl=document.getElementById("cookstate"),
 statusEl=document.getElementById("status"),resEl=document.getElementById("result"),
 errEl=document.getElementById("error");
+function getCookie(){return cookieEl.value.trim();}
+function loadPref(k){try{return localStorage.getItem(k);}catch(e){return null;}}
+function savePref(k,v){try{if(v){localStorage.setItem(k,v);}else{localStorage.removeItem(k);}}catch(e){}}
+// The Cookie is kept in this browser (localStorage), so a refresh never loses it.
+// It is saved on every keystroke and again right before a parse, because the
+// change event alone only fires on blur -- paste-then-refresh used to drop it.
+function saveCookiePref(){
+var v=getCookie();
+savePref("xhs_cookie",v);
+cookStateEl.textContent=v?("已保存在本机浏览器（"+v.length+" 字符），刷新后会自动带上"):"未填写";
+}
+var savedCookie=loadPref("xhs_cookie");
+if(savedCookie){cookieEl.value=savedCookie;cookBoxEl.open=true;}
+var savedFmt=loadPref("xhs_image_format");if(savedFmt){fmtEl.value=savedFmt;}
+var savedPref2=loadPref("xhs_video_preference");if(savedPref2){prefEl.value=savedPref2;}
+saveCookiePref();
+cookieEl.addEventListener("input",saveCookiePref);
+cookBoxEl.addEventListener("toggle",function(){if(cookBoxEl.open){saveCookiePref();}});
+fmtEl.addEventListener("change",function(){savePref("xhs_image_format",fmtEl.value);});
+prefEl.addEventListener("change",function(){savePref("xhs_video_preference",prefEl.value);});
+document.getElementById("cookclear").addEventListener("click",function(){
+cookieEl.value="";saveCookiePref();setStatus("已清除本机保存的 Cookie");});
 function setStatus(t){statusEl.textContent=t||"";}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;
 if(text!==undefined&&text!==null)e.textContent=String(text);return e;}
@@ -1301,10 +1442,12 @@ errEl.appendChild(el("h3",null,t));}
 async function post(){
 var t=inEl.value.trim();
 if(!t){onErrText("请先粘贴分享文案或链接");return;}
+saveCookiePref();
 runEl.disabled=true;errEl.style.display="none";resEl.innerHTML="";setStatus("解析中…");
 try{
 var r=await fetch("/api/parse",{method:"POST",headers:{"Content-Type":"application/json"},
-body:JSON.stringify({text:t,image_format:fmtEl.value,video_preference:prefEl.value})});
+body:JSON.stringify({text:t,image_format:fmtEl.value,video_preference:prefEl.value,
+cookie:getCookie()})});
 var j=await r.json();
 if(!r.ok||!j.ok){onErr(j);return;}
 render(j);setStatus("完成，用时 "+j.source.elapsedMs+" ms");
@@ -1429,7 +1572,8 @@ window.__lbIdx=(window.__lbIdx+d+window.__photos.length)%window.__photos.length;
 if(window.__lbShow){window.__lbShow();}}
 document.getElementById("sample").addEventListener("click",async function(){
 setStatus("获取示例中…");
-try{var r=await fetch("/api/sample");var j=await r.json();
+saveCookiePref();
+try{var r=await fetch("/api/sample?cookie="+encodeURIComponent(getCookie()));var j=await r.json();
 if(!j.ok){onErr(j);return;}
 inEl.value=j.url;setStatus("已填入最新示例链接，点击解析");}
 catch(e){onErrText("示例获取失败："+e);}});
@@ -1475,6 +1619,7 @@ function errorBody(code, message, detail) {
 function statusForCode(code) {
   if (code === 'bad_input' || code === 'no_xhs_link' || code === 'bad_media_url') return 400;
   if (code === 'no_note_data' || code === 'no_note_id' || code === 'no_initial_state') return 404;
+  // 'risk_control' and network failures: the upstream refused to serve us.
   return 502;
 }
 
@@ -1533,12 +1678,16 @@ async function handleParse(request, url) {
   }
 }
 
-async function handleSample() {
+async function handleSample(url) {
   try {
-    return jsonResponse(200, await fetchSampleLink());
+    const cookie = url ? url.searchParams.get('cookie') : null;
+    return jsonResponse(200, await fetchSampleLink(cookie));
   } catch (error) {
     if (error instanceof ParseError) {
-      return jsonResponse(statusForCode(error.code), errorBody(error.code, error.message));
+      return jsonResponse(
+        statusForCode(error.code),
+        errorBody(error.code, error.message, error.detail),
+      );
     }
     return jsonResponse(502, errorBody('sample_failed', '示例链接获取失败'));
   }
@@ -1741,10 +1890,20 @@ const HELP = {
     data: 'XHS-Downloader 原始字段：作品ID/标题/描述/类型/标签/互动数/时间/作者/下载地址/动图地址/文件名',
     media: '归一化媒体块：kind、video（分辨率等）、imageCount、verified',
   },
+  errors: {
+    bad_input: '输入为空或格式不对（400）',
+    no_xhs_link: '输入里没有小红书作品链接（400）',
+    bad_media_url: '媒体地址不在允许的小红书域名内（400）',
+    no_note_data: '页面没返回作品数据，通常是 xsec_token 已过期（404）',
+    no_initial_state: '页面被风控或结构变化，未找到 __INITIAL_STATE__（404）',
+    risk_control: '被要求安全验证，通常是数据中心 IP 风控；填 Cookie 后重试（502）',
+    request_failed: '网络请求失败（502）',
+  },
   notes: [
     '仅用于你有权处理的内容；平台页面结构、风控与地区差异都可能影响结果。',
     '作品链接携带日期信息，旧链接的 xsec_token 会失效，解析失败时请重新获取链接。',
-    '未设置 Cookie 时视频可能只能取到较低画质；本服务不接收、不记录你的 Cookie。',
+    'Cloudflare Worker 的出口是数据中心 IP，比家用宽带更容易被要求安全验证；遇到 risk_control 请填入小红书网页版 Cookie。',
+    '未设置 Cookie 时视频可能只能取到较低画质；本服务不记录你的 Cookie。',
   ],
 };
 
@@ -2059,6 +2218,58 @@ function selftestMediaGuard() {
   return 'media_guard_ok';
 }
 
+function selftestRiskControl() {
+  // Real verification hop observed when this Worker ran on Cloudflare: the short
+  // link resolved, but xiaohongshu answered with a captcha page on a datacenter IP.
+  const captcha =
+    'https://www.xiaohongshu.com/website-login/captcha?redirectPath=http%3A%2F%2Fwww.xiaohongshu.com' +
+    '%2Fdiscovery%2Fitem%2F6a068472000000000803f503%3Fapp_platform%3Dandroid%26ignoreEngage%3Dtrue' +
+    '%26app_version%3D9.45.1%26share_from_user_hidden%3Dtrue%26xsec_source%3Dapp_share%26type%3Dvideo' +
+    '%26xsec_token%3DCBiCODxBwN-F0910X2rFedvHyPMEPPeCY-NQxidj4_tJM%253D%26author_share%3D1' +
+    '%26xhsshare%3DCopyLink%26shareRedId%3DODo7RUk2Skw2NzUyOTgwNjhEOTo7PT86%26apptime%3D1789134927' +
+    '%26share_id%3Dad8feb7f06194a01b472a8aba4a830a6%26share_channel%3Dcopy_link' +
+    '%26track_code%3D1j2tUD6RufO%26exSource%3Dnull&verifyUuid=6dd5d8b4-768c-466e-ba75-823be230caf6' +
+    '&verifyType=217&verifyBiz=461&verifyMsg=null';
+
+  if (!isRiskControlUrl(captcha)) throw new Error('risk: captcha url not detected');
+  if (isRiskControlUrl('https://www.xiaohongshu.com/explore/abc?xsec_token=T')) {
+    throw new Error('risk: note url wrongly flagged');
+  }
+  if (isRiskControlUrl('')) throw new Error('risk: empty url wrongly flagged');
+
+  const recovered = recoverNoteUrlFromRedirect(captcha);
+  if (!recovered) throw new Error('risk: failed to recover note url from redirectPath');
+  if (!recovered.includes('/discovery/item/6a068472000000000803f503')) {
+    throw new Error('risk: recovered wrong target -> ' + recovered);
+  }
+  const noteId = extractLinkId(recovered);
+  if (noteId !== '6a068472000000000803f503') {
+    throw new Error('risk: recovered note id -> ' + noteId);
+  }
+  // the recovered target is http:// and must be upgraded for the site hosts
+  if (!recovered.startsWith('http://')) throw new Error('risk: expected http redirect target');
+  if (!preferHttpsForSite(recovered).startsWith('https://www.xiaohongshu.com/')) {
+    throw new Error('risk: site url not upgraded to https');
+  }
+  // media URLs must not be rewritten by the site upgrade
+  const media = 'http://sns-bak-v1.xhscdn.com/stream/1/110/258/x.mp4';
+  if (preferHttpsForSite(media) !== media) throw new Error('risk: media url must stay untouched');
+
+  if (recoverNoteUrlFromRedirect('https://www.xiaohongshu.com/explore/abc?x=1') !== '') {
+    throw new Error('risk: non-captcha url must not yield a target');
+  }
+  if (recoverNoteUrlFromRedirect('not a url') !== '') {
+    throw new Error('risk: invalid url must not throw');
+  }
+  if (!looksLikeRiskControlHtml('<html>/website-login/captcha</html>')) {
+    throw new Error('risk: html detection');
+  }
+  if (looksLikeRiskControlHtml('<html>normal note page</html>')) {
+    throw new Error('risk: normal html wrongly flagged');
+  }
+  return 'risk_control_ok';
+}
+
 function handleSelfTest() {
   const checks = [];
   try {
@@ -2070,6 +2281,7 @@ function handleSelfTest() {
     checks.push(selftestVideo());
     checks.push(selftestNaming());
     checks.push(selftestMediaGuard());
+    checks.push(selftestRiskControl());
     return jsonResponse(200, { ok: true, checks });
   } catch (error) {
     return jsonResponse(500, errorBody(
@@ -2094,7 +2306,7 @@ export default {
       const path = url.pathname.replace(/\/+$/, '') || '/';
       if (path === '/' || path === '/app' || path === '/index.html') return handlePage();
       if (path === '/help' || path === '/api') return handleHelp();
-      if (path === '/api/sample' || path === '/sample') return await handleSample();
+      if (path === '/api/sample' || path === '/sample') return await handleSample(url);
       if (path === '/api/parse' || path === '/parse') return await handleParse(request, url);
       if (path === '/api/probe' || path === '/probe') return await handleProbe(url);
       if (path === '/api/thumb' || path === '/thumb') return await handleThumb(url);
