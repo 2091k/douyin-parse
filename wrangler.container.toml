@@ -1,0 +1,25 @@
+# Cloudflare Containers 部署配置（可选路线）
+#
+# 用法：npx wrangler deploy -c wrangler.container.toml
+#
+# 注意：这条路线需要 Workers Paid 套餐，且会用 Dockerfile 构建镜像。
+# 原来的 wrangler.toml（纯 Worker 部署）保持不动，两条路线互不影响。
+# 本地 `wrangler dev -c wrangler.container.toml` 需要本机安装 Docker。
+
+name = "douyin-parse-node"
+main = "worker.container.js"
+compatibility_date = "2026-07-29"
+compatibility_flags = ["nodejs_compat"]
+
+[[containers]]
+class_name = "DouyinParser"
+image = "./Dockerfile"
+max_instances = 2
+
+[[durable_objects.bindings]]
+class_name = "DouyinParser"
+name = "DOUYIN_PARSER"
+
+[[migrations]]
+new_sqlite_classes = ["DouyinParser"]
+tag = "v1"

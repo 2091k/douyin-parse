@@ -1,0 +1,16 @@
+{
+  "name": "douyin-parse",
+  "private": true,
+  "type": "module",
+  "description": "抖音分享链接解析（Cloudflare Worker / 本地 Node / 容器 三种运行方式）",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs",
+    "worker": "wrangler dev --port 8787",
+    "deploy:worker": "wrangler deploy",
+    "deploy:container": "wrangler deploy -c wrangler.container.toml"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.1.0"
+  }
+}
