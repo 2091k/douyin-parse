@@ -150,7 +150,9 @@ const IMAGE_MIME_BY_SUFFIX = [
 ];
 
 // Only these hosts may be reached through /dl, /api/probe and /api/thumb.
-const MEDIA_HOST_SUFFIXES = ['xhscdn.com', 'xiaohongshu.com', 'rednote.com'];
+// `rednotecdn.com` is the international twin's CDN (sns-v*.rednotecdn.com,
+// sns-web-*.rednotecdn.com) used by www.rednote.com note pages.
+const MEDIA_HOST_SUFFIXES = ['xhscdn.com', 'rednotecdn.com', 'xiaohongshu.com', 'rednote.com'];
 
 const CORS_HEADERS = [
     'Access-Control-Allow-Origin' => '*',
@@ -862,8 +864,11 @@ function getImagePlan($data, $imageFormat)
     $items = is_array($list) ? $list : [];
     $liveLinks = getLiveLinks($items);
     $tokens = [];
+    $rawDefaults = [];
     foreach ($items as $item) {
-        $tokens[] = extractImageToken(objectExtract($item, 'urlDefault'));
+        $raw = objectExtract($item, 'urlDefault');
+        $rawDefaults[] = is_string($raw) ? $raw : '';
+        $tokens[] = extractImageToken($raw);
     }
     if (!arraySomeTruthy($tokens)) {
         $tokens = [];
@@ -871,13 +876,30 @@ function getImagePlan($data, $imageFormat)
             $tokens[] = extractImageToken(objectExtract($item, 'url'));
         }
     }
+    // International notes (www.rednote.com) deliver image tokens that are only
+    // served by their own rednotecdn.com CDN; requests routed through the
+    // xiaohongshu.com `sns-img-bd` auto base answer 403. The rednote CDN still
+    // exposes the same token on the shared `ci.xiaohongshu.com` converter
+    // base, which does answer 200 — so for rednote-sourced tokens emit the
+    // fixed-format `ci` link, and leave xiaohongshu.com tokens on the
+    // original token-based auto/fixed bases.
+    $rawDefaults = [];
+    foreach ($items as $item) {
+        $raw = objectExtract($item, 'urlDefault');
+        $rawDefaults[] = is_string($raw) ? $raw : '';
+    }
     $urls = [];
-    foreach ($tokens as $token) {
-        $urls[] = decodeUnicodeEscapes(
-            $imageFormat === 'auto'
-                ? generateAutoImageLink($token)
-                : generateFixedImageLink($token, $imageFormat)
-        );
+    foreach ($tokens as $i => $token) {
+        $raw = $rawDefaults[$i] ?? '';
+        if ($raw !== '' && strpos($raw, 'rednotecdn.com') !== false) {
+            $urls[] = decodeUnicodeEscapes(generateFixedImageLink($token, $imageFormat));
+        } else {
+            $urls[] = decodeUnicodeEscapes(
+                $imageFormat === 'auto'
+                    ? generateAutoImageLink($token)
+                    : generateFixedImageLink($token, $imageFormat)
+            );
+        }
     }
     return ['urls' => $urls, 'liveLinks' => $liveLinks, 'tokens' => $tokens];
 }
@@ -1253,7 +1275,8 @@ const RISK_CONTROL_PATTERNS = [
 
 const RISK_CONTROL_HINT =
     '请求被小红书风控拦截（要求安全验证）。Cloudflare Worker 的出口是数据中心 IP，比家用宽带更容易被拦截。' .
-    '请在下方 Cookie 输入框粘贴小红书网页版 Cookie 后重试，或改用带 Cookie 的服务端环境请求。';
+    '请在下方 Cookie 输入框粘贴小红书网页版 Cookie 后重试，或改用带 Cookie 的服务端环境请求。' .
+    '另外：未携带 xsec_token 的作品链接目前会被 /404（error_code=300031），请粘贴小红书 App 分享页的完整链接。';
 
 function isRiskControlUrl($raw)
 {
@@ -1262,7 +1285,9 @@ function isRiskControlUrl($raw)
     foreach (RISK_CONTROL_PATTERNS as $pattern) {
         if (strpos($value, $pattern) !== false) return true;
     }
-    return false;
+    // A plain /login?redirectPath=… hop also carries the real target; treat it
+    // as a verification hop so the note URL can be recovered from redirectPath.
+    return strpos($value, '/login') !== false || strpos($value, '/website-login') !== false;
 }
 
 function looksLikeRiskControlHtml($html)
@@ -1326,6 +1351,16 @@ function extractLinkId($rawUrl)
     $parts = explode('/', $path);
     $last = end($parts);
     return ($last === false || $last === null) ? '' : $last;
+}
+
+/** Pull the xsec_token query parameter out of a note URL (empty when absent). */
+function extractXsecToken($rawUrl)
+{
+    $parsed = parse_url(normalizeUrl($rawUrl));
+    if ($parsed === false) return '';
+    if (!isset($parsed['query'])) return '';
+    parse_str($parsed['query'], $params);
+    return (isset($params['xsec_token']) && is_string($params['xsec_token'])) ? $params['xsec_token'] : '';
 }
 
 function extractIds($links)
@@ -1447,7 +1482,9 @@ function httpGetCurl($url, $headers, $timeoutMs, $headOnly, $maxBytes)
         CURLOPT_NOBODY => $headOnly,
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+        // curl's own default: try HTTP/2, fall back to HTTP/1.1 when the
+        // negotiated 200 response lacks the upgrade or the connection errors.
+        CURLOPT_HTTP_VERSION => 2,
         CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$respHeaders) {
             $len = strlen($line);
             $trim = trim($line);
@@ -1568,7 +1605,7 @@ function requestUrl($rawUrl, $options = [])
                 }
             }
             if ($response['status'] < 200 || $response['status'] >= 300) {
-                $lastError = new Exception('HTTP ' . $response['status']);
+                $lastError = new Exception('HTTP ' . $response['status'] . ' ' . $target);
             } elseif (!$wantContent) {
                 return ['url' => $response['url'], 'text' => ''];
             } else {
@@ -1773,13 +1810,33 @@ function runParse($input, $options = [])
     $steps[] = '作品链接：' . $target;
     $steps[] = '作品 ID：' . $noteId;
 
+    // The main domain (www.xiaohongshu.com) started 302-redirecting anonymous
+    // /discovery/item requests to /login since the 2025-09 revamp; the same
+    // note is still anonymously reachable on its international twin
+    // www.rednote.com. On a failed main-domain fetch, retry the same
+    // xsec_token on rednote before giving up.
     $page = requestUrl($target, ['cookie' => $cookie]);
+    $state = parseInitialState($page['text']);
+    $noteObject = ($state) ? filterNoteObject($state, $noteId) : null;
+    $onRednote = false;
+    if (!($noteObject && count($noteObject))) {
+        $token = extractXsecToken($target);
+        if ($token !== '') {
+            $rednoteUrl = REDNOTE_ORIGIN . '/explore/' . $noteId .
+                '?xsec_token=' . rawurlencode($token) . '&xsec_source=pc_feed';
+            $steps[] = '主域匿名访问被风控（302 → /login），已自动切换 rednote 国际版：' . $rednoteUrl;
+            $page = requestUrl($rednoteUrl, ['cookie' => $cookie]);
+            $state = parseInitialState($page['text']);
+            $noteObject = ($state) ? filterNoteObject($state, $noteId) : null;
+            $onRednote = true;
+        }
+    }
     $steps[] = '页面大小：' . jsStrLen($page['text']) . ' 字符';
-    if (isRiskControlUrl($page['url']) || looksLikeRiskControlHtml($page['text'])) {
+    if (($noteObject && count($noteObject)) === false &&
+        (isRiskControlUrl($page['url']) || looksLikeRiskControlHtml($page['text']))) {
         $steps[] = '作品页返回安全验证页：' . $page['url'];
         throw new XhsParseError('risk_control', RISK_CONTROL_HINT, ['steps' => $steps]);
     }
-    $state = parseInitialState($page['text']);
     if (!$state) {
         throw new XhsParseError(
             'no_initial_state',
@@ -1789,11 +1846,11 @@ function runParse($input, $options = [])
     }
     $steps[] = '已解析 window.__INITIAL_STATE__';
 
-    $noteObject = filterNoteObject($state, $noteId);
     if (!$noteObject || !count($noteObject)) {
         throw new XhsParseError(
             'no_note_data',
-            '页面未返回作品数据：链接可能已过期（xsec_token 失效）或被风控，可尝试传入 Cookie',
+            '页面未返回作品数据：链接可能已过期（xsec_token 失效）或被风控，可尝试传入 Cookie' .
+            ($onRednote ? '（主域与 rednote 国际版均已尝试）' : ''),
             ['steps' => $steps]
         );
     }
@@ -1892,34 +1949,60 @@ function runParse($input, $options = [])
 function fetchSampleLink($cookie)
 {
     $steps = [];
-    $page = requestUrl(XHS_ORIGIN . '/explore', ['cookie' => $cookie]);
-    if (isRiskControlUrl($page['url']) || looksLikeRiskControlHtml($page['text'])) {
-        $steps[] = '首页返回安全验证页：' . $page['url'];
-        throw new XhsParseError('risk_control', RISK_CONTROL_HINT, ['steps' => $steps]);
-    }
-    $state = parseInitialState($page['text']);
-    if (!$state) {
-        throw new XhsParseError('no_initial_state', '未能在首页找到 __INITIAL_STATE__', ['steps' => $steps]);
-    }
-    $found = null;
-    $walk = function ($node, $depth) use (&$walk, &$found) {
-        if ($found !== null || $depth > 12 || $node === null || !is_array($node)) return;
-        if (!isListArr($node) && isset($node['id']) && is_string($node['id']) &&
-            preg_match('/^[0-9a-f]{24}$/', $node['id']) &&
-            isset($node['xsecToken']) && is_string($node['xsecToken'])) {
-            $found = ['id' => $node['id'], 'token' => $node['xsecToken']];
-            return;
+    // Preferred source is the domestic home (www.xiaohongshu.com) so the sample
+    // link is a xiaohongshu.com URL. Its anonymous explore feed now requires a
+    // login, so when a cookie is supplied it is forwarded and the domestic feed
+    // usually yields real items. Only when the domestic feed is empty/unavailable
+    // do we fall back to the international twin rednote.com (which still serves a
+    // ~35-item anonymous feed) — so the sample link can still be produced.
+    $probed = 0;
+    foreach ([XHS_ORIGIN . '/explore', REDNOTE_ORIGIN . '/'] as $feedUrl) {
+        $probed++;
+        try {
+            $page = requestUrl($feedUrl, ['cookie' => $cookie]);
+        } catch (XhsParseError $error) {
+            $steps[] = '首页请求失败（' . substr($feedUrl, 0, 24) . '…）：' . $error->getMessage();
+            continue;
         }
-        foreach ($node as $value) $walk($value, $depth + 1);
-    };
-    $walk($state, 0);
-    if ($found === null) {
-        throw new XhsParseError('no_sample', '推荐流中未找到可用的作品链接');
+        // A plain /login redirect on the domestic feed is expected when no
+        // cookie is supplied: record it and move on to the next source instead
+        // of aborting. Only a genuine captcha/verification page (which cannot
+        // be bypassed by a feed fallback) aborts the loop.
+        if (looksLikeRiskControlHtml($page['text']) && !isRiskControlUrl($page['url'])) {
+            $steps[] = '首页返回安全验证页：' . $page['url'];
+            throw new XhsParseError('risk_control', RISK_CONTROL_HINT, ['steps' => $steps]);
+        }
+        if (isRiskControlUrl($page['url'])) {
+            $steps[] = '首页被要求登录，尝试下一个来源：' . $page['url'];
+        }
+        $state = parseInitialState($page['text']);
+        if (!$state) {
+            $steps[] = '未能在首页（' . substr($feedUrl, 0, 24) . '…）找到 __INITIAL_STATE__';
+            continue;
+        }
+        $found = null;
+        $walk = function ($node, $depth) use (&$walk, &$found) {
+            if ($found !== null || $depth > 12 || $node === null || !is_array($node)) return;
+            if (!isListArr($node) && isset($node['id']) && is_string($node['id']) &&
+                preg_match('/^[0-9a-f]{24}$/', $node['id']) &&
+                isset($node['xsecToken']) && is_string($node['xsecToken'])) {
+                $found = ['id' => $node['id'], 'token' => $node['xsecToken']];
+                return;
+            }
+            foreach ($node as $value) $walk($value, $depth + 1);
+        };
+        $walk($state, 0);
+        if ($found !== null) {
+            $base = (strpos($feedUrl, 'rednote') !== false) ? REDNOTE_ORIGIN : XHS_ORIGIN;
+            $url = $base . '/explore/' . $found['id'] .
+                '?xsec_token=' . rawurlencode($found['token']) . '&xsec_source=pc_feed';
+            $steps[] = '取自首页推荐流（' . substr($base, 8) . '）';
+            return ['ok' => true, 'url' => $url, 'noteId' => $found['id'], 'steps' => $steps];
+        }
+        $steps[] = '推荐流中未找到可用的作品链接（' . substr($feedUrl, 0, 24) . '…）';
     }
-    $url = XHS_ORIGIN . '/explore/' . $found['id'] .
-        '?xsec_token=' . rawurlencode($found['token']) . '&xsec_source=pc_feed';
-    $steps[] = '取自首页推荐流';
-    return ['ok' => true, 'url' => $url, 'noteId' => $found['id'], 'steps' => $steps];
+    $hint = '国内主域匿名 feed 为空（需登录），国际版 rednote 也未取到；请粘贴一条带 xsec_token 的分享链接解析，或在 Cookie 输入框填入小红书网页版 Cookie 后重试';
+    throw new XhsParseError('no_sample', '推荐流中未找到可用的作品链接（已探测 ' . $probed . ' 个来源）', ['steps' => $steps, 'hint' => $hint]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2360,15 +2443,21 @@ function handleParse()
 function handleSample()
 {
     try {
-        jsonResponse(200, fetchSampleLink(getParam('cookie')));
+        $result = fetchSampleLink(getParam('cookie'));
     } catch (XhsParseError $error) {
         jsonResponse(
             statusForCode($error->errorCode),
             errorBody($error->errorCode, $error->getMessage(), $error->detail)
         );
     } catch (Throwable $error) {
-        jsonResponse(502, errorBody('sample_failed', '示例链接获取失败'));
+        // Surface the real cause: curl/network failures that were not wrapped
+        // into an XhsParseError must not be silently swallowed here.
+        jsonResponse(
+            502,
+            errorBody('sample_failed', '示例链接获取失败：' . $error->getMessage())
+        );
     }
+    jsonResponse(200, $result);
 }
 
 function handleProbe()
